@@ -266,6 +266,7 @@ static void redis_cluster_init(redisCluster *c, HashTable *ht_seeds, double time
     }
 
     /* Initialize seeds and attempt to map keyspace */
+    if (hash) c->cache_key = zend_string_copy(hash);
     cluster_init_seeds(c, seeds, nseeds);
     if (cluster_map_keyspace(c) == SUCCESS && hash)
         cluster_cache_store(hash, c->nodes);
@@ -923,7 +924,7 @@ PHP_METHOD(RedisCluster, keys) {
 
     /* Iterate over our known nodes */
     ZEND_HASH_FOREACH_PTR(c->nodes, node) {
-        if (node == NULL) continue;
+        if (node == NULL || zend_llist_count(&node->slots) == 0) continue;
         if (cluster_send_slot(c, node->slot, cmd, cmd_len, TYPE_MULTIBULK
                             ) < 0)
         {
@@ -2037,7 +2038,7 @@ PHP_METHOD(RedisCluster, _masters) {
     array_init(return_value);
 
     ZEND_HASH_FOREACH_PTR(c->nodes, node) {
-        if (node == NULL) break;
+        if (node == NULL || zend_llist_count(&node->slots) == 0) continue;
 
         zval z_sub;
 

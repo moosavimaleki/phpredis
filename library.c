@@ -3507,6 +3507,7 @@ redis_sock_disconnect(RedisSock *redis_sock, int force, int is_reset_mode)
     }
     redis_sock->status = REDIS_SOCK_STATUS_DISCONNECTED;
     redis_sock->watching = 0;
+    redis_sock->readonly = 0;
 
     return SUCCESS;
 }
