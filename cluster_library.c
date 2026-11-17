@@ -1138,7 +1138,7 @@ static int cluster_probe(redisCluster *c, RedisSock *source) {
         /* Empty/NULL endpoints mean the responding host, per CLUSTER SLOTS. */
         for (size_t i = 0; i < reply->elements; i++) {
             clusterReply *row = reply->element[i];
-            if (row->type != TYPE_MULTIBULK) continue;
+            if (row->type != TYPE_MULTIBULK || row->elements < 3) continue;
             for (size_t j = 2; j < row->elements; j++) {
                 clusterReply *entry = row->element[j];
                 if (entry->type == TYPE_MULTIBULK && entry->elements >= 2) {
@@ -1606,6 +1606,10 @@ PHP_REDIS_API short cluster_send_command(redisCluster *c, short slot, const char
 
         /* Handle MOVED or ASKING redirection */
         if (resp == 1) {
+           if (c->redir_slot != slot) {
+               CLUSTER_THROW_EXCEPTION("Redirection slot does not match the command", 0);
+               return FAILURE;
+           }
            /* Abort if we're in a transaction as it will be invalid */
            if (!cluster_can_refresh(c)) {
                CLUSTER_THROW_EXCEPTION("Can't process redirection during WATCH/MULTI", 0);

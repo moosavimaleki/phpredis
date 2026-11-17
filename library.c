@@ -3376,7 +3376,7 @@ PHP_REDIS_API int redis_sock_connect(RedisSock *redis_sock)
             int limit = INI_INT("redis.pconnect.connection_limit");
             if (limit > 0 && p->nb_active >= limit) {
                 redis_sock_set_err(redis_sock, ZEND_STRL("Connection limit reached"));
-                return FAILURE;
+                return REDIS_SOCK_CONNECT_LIMIT;
             }
 
             gettimeofday(&tv, NULL);

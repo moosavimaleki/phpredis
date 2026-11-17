@@ -84,6 +84,8 @@ PHP_REDIS_API void redis_parse_client_list_response(char *response, zval *z_ret)
 PHP_REDIS_API int redis_type_response(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock, zval *z_tab, void *ctx);
 PHP_REDIS_API RedisSock* redis_sock_create(char *host, int host_len, int port, double timeout, double read_timeout, int persistent, char *persistent_id, long retry_interval);
 PHP_REDIS_API int redis_sock_configure(RedisSock *redis_sock, HashTable *opts);
+/* Local pool exhaustion must not trigger network/topology recovery. */
+#define REDIS_SOCK_CONNECT_LIMIT -2
 PHP_REDIS_API int redis_sock_connect(RedisSock *redis_sock);
 PHP_REDIS_API int redis_sock_server_open(RedisSock *redis_sock);
 PHP_REDIS_API int redis_sock_auth(RedisSock *redis_sock);

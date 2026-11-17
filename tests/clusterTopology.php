@@ -20,12 +20,13 @@ scenario('MOVED refreshes all slots and primary registry', function($n) {
     check($c->get('{bar}')==='fresh','second slot');
     check($c->_masters()===[$n[1]],'registry');
 });
-foreach (['overlap','range','host','port','stale','hole'] as $bad) {
+foreach (['overlap','range','host','port','stale','hole','nil-row'] as $bad) {
     scenario("invalid/stale refresh: $bad", function($n) use($bad) {
         $old=[[0,16383,$n[0]]];
         $maps=['overlap'=>[[0,8191,$n[1]],[8191,16383,$n[1]]], 'range'=>[[0,16384,$n[1]]],
             'host'=>[[0,16383,["bad\0host",1234]]], 'port'=>[[0,16383,['127.0.0.1',65536]]],
-            'stale'=>$old,'hole'=>[[0,8191,$n[1]]]];
+            'stale'=>$old,'hole'=>[[0,8191,$n[1]]],
+            'nil-row'=>['raw'=>"*1\r\n*-1\r\n"]];
         return [['CLUSTER SLOTS'=>[$old,$maps[$bad]],'GET'=>[['error'=>"MOVED 12182 {$n[1][0]}:{$n[1][1]}"],'old']],
             ['CLUSTER SLOTS'=>[$maps[$bad]],'GET'=>['new']]];
     },function($c,$n) use($bad) {
@@ -35,6 +36,16 @@ foreach (['overlap','range','host','port','stale','hole'] as $bad) {
     });
 }
 foreach (['MOVED','ASK'] as $redirect) {
+    scenario("reject mismatched $redirect slot before discovery",function($n) use($redirect) {
+        return [['CLUSTER SLOTS'=>[[[0,16383,$n[0]]]],'GET'=>[['error'=>"$redirect 0 {$n[1][0]}:{$n[1][1]}"],'old']],
+            ['CLUSTER SLOTS'=>[[[0,8191,$n[1]]]],'GET'=>['new']]];
+    },function($c,$n) {
+        fails(fn()=>$c->get('{foo}'));
+        check($c->_masters()===[$n[0]],'mismatched redirect changed topology');
+        check($c->get('{foo}')==='old','command after rejected redirect');
+        $calls=json_decode($c->rawCommand($n[0],'FIXTURE'),true);
+        check(($calls[1]['GET']??0)===0 && ($calls[1]['CLUSTER SLOTS']??0)===0,'mismatched redirect followed');
+    });
     scenario("WATCH rejects $redirect",function($n) use($redirect) {
         return [['CLUSTER SLOTS'=>[[[0,16383,$n[0]]]],'WATCH'=>[['error'=>"$redirect 12182 {$n[1][0]}:{$n[1][1]}"]]]];
     },function($c,$n) { fails(fn()=>$c->watch('{foo}')); check($c->_masters()===[$n[0]],'WATCH remapped'); });
@@ -92,6 +103,32 @@ scenario('empty MOVED host uses responding host',function($n) {
     return [['CLUSTER SLOTS'=>[[[0,16383,$n[0]]]],'GET'=>[['error'=>"MOVED 12182 :{$n[1][1]}"]]],
         ['CLUSTER SLOTS'=>[[[0,16383,['',$n[1][1]]]]],'GET'=>['fresh']]];
 },function($c,$n) { check($c->get('{foo}')==='fresh','empty endpoint'); });
+
+$pooling = ini_get('redis.pconnect.pooling_enabled');
+$limit = ini_get('redis.pconnect.connection_limit');
+ini_set('redis.pconnect.pooling_enabled', '1');
+ini_set('redis.pconnect.connection_limit', '1');
+$fixture = new ClusterTopologyFixture(fn($n) => [
+    ['CLUSTER SLOTS'=>[[[0,16383,$n[0]]]],'GET'=>['healthy']],
+]);
+try {
+    $args = [null,[implode(':',$fixture->nodes[0])],.2,.2,true];
+    $first = new RedisCluster(...$args);
+    $second = new RedisCluster(...$args);
+    check($first->get('{foo}')==='healthy','first persistent lease');
+    fails(fn()=>$second->get('{foo}'));
+    $calls = json_decode($first->rawCommand($fixture->nodes[0],'FIXTURE'),true);
+    check(($calls[0]['CLUSTER SLOTS']??0)===2,'pool limit triggered discovery');
+    check(($calls[0]['GET']??0)===1,'pool limit sent payload');
+    check($first->get('{foo}')==='healthy','healthy persistent lease damaged');
+    $first->close(); $second->close();
+    unset($first, $second);
+    echo "PASS pool capacity is not a network failure\n";
+} finally {
+    $fixture->close();
+    ini_set('redis.pconnect.pooling_enabled', $pooling);
+    ini_set('redis.pconnect.connection_limit', $limit);
+}
 
 ini_set('redis.clusters.cache_slots','1');
 $fixture = new ClusterTopologyFixture(function($n) {

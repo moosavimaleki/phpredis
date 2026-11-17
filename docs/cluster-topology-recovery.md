@@ -82,3 +82,39 @@ Validation on PHP 8.5.4 and Redis 8.0.5:
 
 The final suite runs used a fixed built module throughout. Rebuilding a shared
 module while PHP processes have it mapped can invalidate the test run.
+
+## Review of 2abc3157
+
+The follow-up review compared the patch with the original `df4fab2d` build,
+including malformed responses. It confirmed and fixed three introduced defects:
+
+| Trigger | Before the fix | Corrected behavior |
+| --- | --- | --- |
+| MOVED names a different slot and the new map omits the command's slot | PHP exits with SIGSEGV (139); the original build throws | Reject mismatched MOVED/ASK before discovery or redirect; retain the map and allow the next command |
+| SLOTS contains a RESP null array as a range row | PHP exits with SIGSEGV (139); the original build throws | Reject the row before endpoint normalization can index its NULL element array; retain the previous map |
+| A second persistent client reaches the PHP connection pool limit | Counts local capacity as two network failures and runs discovery | Return a distinct internal connection-limit result; fail the command without discovery or payload, preserving the healthy client's lease |
+
+The first two reproducers were run against both the original build and the
+unfixed patch. The capacity reproducer observed three SLOTS calls before the
+fix and two after it (the two constructor discoveries). No error-message
+matching, new retry loop, or application-pool change is involved. All existing
+callers of `redis_sock_connect` treat non-success results as failures; the
+topology retry path counts only transport `FAILURE` results.
+
+Validation after these fixes, on the same PHP 8.5.4 / Redis 8.0.5 environment:
+
+- All 23 deterministic topology scenarios passed, including both mismatched
+  redirect types, null-array discovery, and persistent pool exhaustion.
+- Redis: 242 passed, 10 skipped. RedisCluster: 219 passed, 43 skipped.
+  Session tests used explicit extension paths for their child processes.
+- The real emscore pool test passed with Swoole 6.2.2 and coroutine hooks.
+- Three failovers passed with nonpersistent connections; another three passed
+  with slot caching and persistent pooling. Counters reached six without
+  duplicated INCRs; nonpersistent close left only the six observer clients.
+- Valgrind over all 23 deterministic scenarios reported zero errors and zero
+  definitely, indirectly, or possibly lost bytes.
+
+These checks do not establish that no unknown bugs remain. Legacy shared
+persistent-stream limitations described above are unchanged. TLS/ACL failover
+results in the preceding section belong to the initial patch validation;
+they were not rerun for this follow-up.
