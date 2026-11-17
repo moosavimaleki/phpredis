@@ -55,7 +55,7 @@
 
 /* Protected sending of data down the wire to a RedisSock->stream */
 #define CLUSTER_SEND_PAYLOAD(sock, buf, len) \
-    (sock && !redis_sock_server_open(sock) && sock->stream && !redis_check_eof(sock, 0, 1) && \
+    (sock && !redis_sock_server_open(sock) && sock->stream && !redis_check_eof(sock, 1, 1) && \
      redis_sock_write_raw(sock, buf, len) == len)
 
 /* Macro to read our reply type character */
@@ -225,6 +225,7 @@ typedef struct redisCluster {
     /* The slot our command is operating on, as well as it's socket */
     unsigned short cmd_slot;
     RedisSock *cmd_sock;
+    RedisSock *asking_sock; /* Temporary ASK destination, never a slot owner. */
 
     /* The slot where we're subscribed */
     short subscribed_slot;

@@ -255,6 +255,8 @@ static void redis_cluster_init(redisCluster *c, HashTable *ht_seeds, double time
     c->flags->persistent = persistent;
     c->waitms = (long)(1000 * (timeout + read_timeout));
 
+    cluster_init_seeds(c, seeds, nseeds);
+
     /* Attempt to load slots from cache if caching is enabled */
     if (CLUSTER_CACHING_ENABLED()) {
         /* Exit early if we can load from cache */
@@ -266,7 +268,7 @@ static void redis_cluster_init(redisCluster *c, HashTable *ht_seeds, double time
     }
 
     /* Initialize seeds and attempt to map keyspace */
-    cluster_init_seeds(c, seeds, nseeds);
+    if (hash) c->cache_key = zend_string_copy(hash);
     if (cluster_map_keyspace(c) == SUCCESS && hash)
         cluster_cache_store(hash, c->nodes);
 
@@ -2137,6 +2139,8 @@ PHP_METHOD(RedisCluster, watch) {
         if (cluster_dist_add_key(c, ht_dist, ZSTR_VAL(zstr), ZSTR_LEN(zstr), NULL) == FAILURE) {
             CLUSTER_THROW_EXCEPTION("Can't issue WATCH command as the keyspace isn't fully mapped", 0);
             zend_string_release(zstr);
+            cluster_dist_free(ht_dist);
+            efree(z_args);
             RETURN_FALSE;
         }
         zend_string_release(zstr);
@@ -2163,7 +2167,13 @@ PHP_METHOD(RedisCluster, watch) {
         }
 
         // If we get a failure from this, we have to abort
-        if (cluster_send_command(c,(short)slot,cmd.c,cmd.len) ==-1) {
+        c->readonly = 0;
+        c->redir_type = REDIR_NONE;
+        if (cluster_send_slot(c, (short)slot, cmd.c, cmd.len, TYPE_LINE) < 0 || c->err) {
+            cluster_dist_free(ht_dist);
+            efree(z_args);
+            efree(cmd.c);
+            CLUSTER_THROW_EXCEPTION("WATCH failed; caller must abort the operation", 0);
             RETURN_FALSE;
         }
 
@@ -2695,7 +2705,8 @@ PHP_METHOD(RedisCluster, scan) {
         }
 
         // Send it to the node in question
-        if (cluster_send_command(c, slot, cmd, cmd_len) < 0)
+        c->redir_type = REDIR_NONE;
+        if (cluster_send_slot(c, slot, cmd, cmd_len, TYPE_MULTIBULK) < 0)
         {
             CLUSTER_THROW_EXCEPTION("Couldn't send SCAN to node", 0);
             efree(cmd);

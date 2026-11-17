@@ -757,8 +757,7 @@ redis_sock_read_bulk_reply(RedisSock *redis_sock, int bytes)
     /* Consume bulk string */
     while (offset < nbytes) {
         got = redis_sock_read_raw(redis_sock, reply + offset, nbytes - offset);
-        if (got < 0 || (got == 0 && php_stream_eof(redis_sock->stream)))
-            break;
+        if (got <= 0) break;
 
         offset += got;
     }
@@ -766,6 +765,7 @@ redis_sock_read_bulk_reply(RedisSock *redis_sock, int bytes)
     /* Protect against reading too few bytes */
     if (offset < nbytes) {
         /* Error or EOF */
+        redis_sock_disconnect(redis_sock, 1, 1);
         REDIS_THROW_EXCEPTION("socket error on read socket", 0);
         efree(reply);
         return NULL;
@@ -4460,7 +4460,8 @@ redis_read_reply_type(RedisSock *redis_sock, REDIS_REPLY_TYPE *reply_type,
 
     // Attempt to read the reply-type byte
     if((*reply_type = redis_sock_getc(redis_sock)) == EOF) {
-        REDIS_THROW_EXCEPTION( "socket error on read socket", 0);
+        redis_sock_disconnect(redis_sock, 1, 1);
+        REDIS_THROW_EXCEPTION("socket error on read socket", 0);
         return -1;
     }
 
@@ -4474,6 +4475,8 @@ redis_read_reply_type(RedisSock *redis_sock, REDIS_REPLY_TYPE *reply_type,
 
         /* Read up to our newline */
         if (redis_sock_get_line(redis_sock, inbuf, sizeof(inbuf), &nread) == NULL) {
+            redis_sock_disconnect(redis_sock, 1, 1);
+            REDIS_THROW_EXCEPTION("socket error reading reply header", 0);
             return -1;
         }
 

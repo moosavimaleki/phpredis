@@ -7,6 +7,7 @@
 #include <zend_exceptions.h>
 
 extern zend_class_entry *redis_cluster_exception_ce;
+extern zend_class_entry *redis_exception_ce;
 int le_cluster_slot_cache;
 
 /* Debugging methods/
@@ -282,7 +283,10 @@ static int cluster_send_direct(RedisSock *redis_sock, char *cmd, int cmd_len,
     /* Connect to the socket if we aren't yet and send our command, validate the reply type, and consume the first line */
     if (!CLUSTER_SEND_PAYLOAD(redis_sock,cmd,cmd_len) ||
         !CLUSTER_VALIDATE_REPLY_TYPE(redis_sock, type) ||
-        !redis_sock_gets_raw(redis_sock, buf, sizeof(buf))) return -1;
+        !redis_sock_gets_raw(redis_sock, buf, sizeof(buf))) {
+        redis_sock_disconnect(redis_sock, 1, 1);
+        return -1;
+    }
 
     /* Success! */
     return 0;
@@ -684,22 +688,22 @@ cluster_node_add_slave(redisClusterNode *master, redisClusterNode *slave)
 
 /* Sanity check/validation for CLUSTER SLOTS command */
 #define VALIDATE_SLOTS_OUTER(r) \
-    (r->elements >= 3 && r2->element[0]->type == TYPE_INT && \
-     r->element[1]->type == TYPE_INT)
+    (r->type == TYPE_MULTIBULK && r->elements >= 3 && \
+     r->element[0]->type == TYPE_INT && r->element[1]->type == TYPE_INT)
 #define VALIDATE_SLOTS_INNER(r) \
     (r->type == TYPE_MULTIBULK && r->elements >= 2 && \
      r->element[0]->type == TYPE_BULK && r->element[1]->type == TYPE_INT)
 
 /* Use the output of CLUSTER SLOTS to map our nodes */
-static int cluster_map_slots(redisCluster *c, clusterReply *r) {
+static int cluster_build_slots(redisCluster *c, clusterReply *r) {
     redisClusterNode *pnode, *master, *slave;
     redisSlotRange range;
     int i,j, hlen, klen;
-    short low, high;
+    int low, high;
     clusterReply *r2, *r3;
     unsigned short port;
     char *host, key[1024];
-    zend_hash_clean(c->nodes);
+
     for (i = 0; i < r->elements; i++) {
         // Inner response
         r2 = r->element[i];
@@ -713,11 +717,16 @@ static int cluster_map_slots(redisCluster *c, clusterReply *r) {
         r3 = r2->element[2];
 
         // Grab our slot range, as well as master host/port
-        low  = (unsigned short)r2->element[0]->integer;
-        high = (unsigned short)r2->element[1]->integer;
+        if (r2->element[0]->integer >= REDIS_CLUSTER_SLOTS ||
+            r2->element[1]->integer >= REDIS_CLUSTER_SLOTS ||
+            r2->element[0]->integer > r2->element[1]->integer) return FAILURE;
+        low = r2->element[0]->integer;
+        high = r2->element[1]->integer;
         host = r3->element[0]->str;
         hlen = r3->element[0]->len;
-        port = (unsigned short)r3->element[1]->integer;
+        if (!hlen || hlen >= 255 || memchr(host, '\0', hlen) ||
+            !r3->element[1]->integer || r3->element[1]->integer > 65535) return FAILURE;
+        port = r3->element[1]->integer;
 
         // If the node is new, create and add to nodes.  Otherwise use it.
         klen = snprintf(key, sizeof(key), "%s:%d", host, port);
@@ -732,6 +741,9 @@ static int cluster_map_slots(redisCluster *c, clusterReply *r) {
                     return -1;
                 }
 
+                if (r3->element[0]->len >= 255 ||
+                    memchr(r3->element[0]->str, '\0', r3->element[0]->len) ||
+                    !r3->element[1]->integer || r3->element[1]->integer > 65535) return FAILURE;
                 // Skip slaves where the host is ""
                 if (r3->element[0]->len == 0) continue;
 
@@ -747,6 +759,7 @@ static int cluster_map_slots(redisCluster *c, clusterReply *r) {
 
         // Attach this node to each slot in the range
         for (j = low; j<= high; j++) {
+            if (c->master[j]) return FAILURE;
             c->master[j] = master;
         }
 
@@ -759,6 +772,31 @@ static int cluster_map_slots(redisCluster *c, clusterReply *r) {
     return 0;
 }
 
+static void ht_free_node(zval *data);
+
+/* Publish a complete routing generation only after parsing succeeds. */
+static int cluster_map_slots(redisCluster *c, clusterReply *reply) {
+    redisCluster *next = ecalloc(1, sizeof(*next));
+    HashTable *old;
+    int result;
+
+    next->flags = c->flags;
+    ALLOC_HASHTABLE(next->nodes);
+    zend_hash_init(next->nodes, 0, NULL, ht_free_node, 0);
+    result = cluster_build_slots(next, reply);
+    if (result == SUCCESS) {
+        old = c->nodes;
+        c->nodes = next->nodes;
+        next->nodes = old;
+        memcpy(c->master, next->master, sizeof(c->master));
+        c->cmd_sock = NULL;
+    }
+    zend_hash_destroy(next->nodes);
+    FREE_HASHTABLE(next->nodes);
+    efree(next);
+    return result;
+}
+
 /* Free a redisClusterNode structure */
 PHP_REDIS_API void cluster_free_node(redisClusterNode *node) {
     if (node->slaves) {
@@ -767,37 +805,31 @@ PHP_REDIS_API void cluster_free_node(redisClusterNode *node) {
     }
 
     zend_llist_destroy(&node->slots);
+    /* Active pooled streams are exclusively leased. Retire them instead of
+     * handing connection-local READONLY state to the next routing generation.
+     * Legacy persistent streams may be shared by other live objects. */
+    redis_sock_disconnect(node->sock, INI_INT("redis.pconnect.pooling_enabled"), 1);
     redis_free_socket(node->sock);
 
     efree(node);
 }
 
-/* Get or create a redisClusterNode that corresponds to the asking redirection */
-static redisClusterNode *cluster_get_asking_node(redisCluster *c) {
-    redisClusterNode *pNode;
-    char key[1024];
-    int key_len;
-
-    /* Hashed by host:port */
-    key_len = snprintf(key, sizeof(key), "%s:%u", c->redir_host, c->redir_port);
-
-    /* See if we've already attached to it */
-    if ((pNode = zend_hash_str_find_ptr(c->nodes, key, key_len)) != NULL) {
-        return pNode;
-    }
-
-    /* This host:port is unknown to us, so add it */
-    pNode = cluster_node_create(c, c->redir_host, c->redir_host_len,
-        c->redir_port, c->redir_slot, 0);
-
-    /* Return the node */
-   return pNode;
-}
-
-/* Get or create a node at the host:port we were asked to check, and return the
- * redis_sock for it. */
+/* ASK owns a temporary socket, outside the permanent topology. */
 static RedisSock *cluster_get_asking_sock(redisCluster *c) {
-    return cluster_get_asking_node(c)->sock;
+    redisClusterNode *node;
+    RedisSock *sock;
+    if (c->asking_sock) {
+        redis_sock_disconnect(c->asking_sock, 1, 1);
+        redis_free_socket(c->asking_sock);
+    }
+    node = cluster_node_create(c, c->redir_host, c->redir_host_len,
+                               c->redir_port, c->redir_slot, 0);
+    sock = node->sock;
+    sock->persistent = 0;
+    zend_llist_destroy(&node->slots);
+    efree(node);
+    c->asking_sock = sock;
+    return sock;
 }
 
 /* Our context seeds will be a hash table with RedisSock* pointers */
@@ -867,6 +899,10 @@ cluster_free(redisCluster *c, int free_ctx)
 {
     /* Disconnect from each node we're connected to */
     cluster_disconnect(c, 0);
+    if (c->asking_sock) {
+        redis_sock_disconnect(c->asking_sock, 1, 1);
+        redis_free_socket(c->asking_sock);
+    }
 
     /* Free any allocated prefix */
     if (c->flags->prefix) zend_string_release(c->flags->prefix);
@@ -990,7 +1026,6 @@ PHP_REDIS_API void cluster_cache_free(redisCachedCluster *rcc) {
 /* Initialize cluster from cached slots */
 PHP_REDIS_API
 void cluster_init_cache(redisCluster *c, redisCachedCluster *cc) {
-    RedisSock *sock;
     redisClusterNode *mnode, *slave;
     redisCachedMaster *cm;
     char key[HOST_NAME_MAX];
@@ -1012,17 +1047,6 @@ void cluster_init_cache(redisCluster *c, redisCachedCluster *cc) {
 
         /* Hash our host and port */
         keylen = snprintf(key, sizeof(key), "%s:%u", ZSTR_VAL(cm->host.addr), cm->host.port);
-
-        /* Create socket */
-        sock = redis_sock_create(ZSTR_VAL(cm->host.addr), ZSTR_LEN(cm->host.addr), cm->host.port,
-                                 c->flags->timeout, c->flags->read_timeout, c->flags->persistent,
-                                 NULL, 0);
-
-        /* Stream context */
-        sock->stream_ctx = c->flags->stream_ctx;
-
-        /* Add to seed nodes */
-        zend_hash_str_update_ptr(c->seeds, key, keylen, sock);
 
         /* Create master node */
         mnode = cached_master_clone(c, cm);
@@ -1091,42 +1115,93 @@ cluster_init_seeds(redisCluster *c, zend_string **seeds, uint32_t nseeds)
     efree(map);
 }
 
-/* Initial mapping of our cluster keyspace */
-PHP_REDIS_API int cluster_map_keyspace(redisCluster *c) {
-    RedisSock *seed;
-    clusterReply *slots = NULL;
-    int mapped = 0;
+/* Recovery is forbidden while connection-local state is active. */
+static int cluster_can_refresh(redisCluster *c) {
+    redisClusterNode *node;
+    if (c->flags->mode == MULTI || c->subscribed_slot >= 0) return 0;
+    ZEND_HASH_FOREACH_PTR(c->nodes, node) {
+        if (node->sock->watching) return 0;
+    } ZEND_HASH_FOREACH_END();
+    return 1;
+}
 
-    // Iterate over seeds until we can get slots
-    ZEND_HASH_FOREACH_PTR(c->seeds, seed) {
-        // Attempt to connect to this seed node
-        if (seed == NULL || redis_sock_server_open(seed) != SUCCESS) {
-            continue;
-        }
-
-        // Parse out cluster nodes.  Flag mapped if we are valid
-        slots = cluster_get_slots(seed);
-        if (slots) {
-            mapped = !cluster_map_slots(c, slots);
-            // Bin anything mapped, if we failed somewhere
-            if (!mapped) {
-                memset(c->master, 0, sizeof(redisClusterNode*)*REDIS_CLUSTER_SLOTS);
+/* Discovery never borrows a data stream, including persistent streams. */
+static int cluster_probe(redisCluster *c, RedisSock *source) {
+    RedisSock *probe = redis_sock_create(ZSTR_VAL(source->host), ZSTR_LEN(source->host),
+        source->port, c->flags->timeout, c->flags->read_timeout, 0, NULL, 0);
+    clusterReply *reply = NULL;
+    int result = FAILURE;
+    probe->stream_ctx = c->flags->stream_ctx;
+    redis_sock_set_auth(probe, c->flags->user, c->flags->pass);
+    if (redis_sock_server_open(probe) == SUCCESS) reply = cluster_get_slots(probe);
+    if (reply) {
+        /* Empty/NULL endpoints mean the responding host, per CLUSTER SLOTS. */
+        for (size_t i = 0; i < reply->elements; i++) {
+            clusterReply *row = reply->element[i];
+            if (row->type != TYPE_MULTIBULK) continue;
+            for (size_t j = 2; j < row->elements; j++) {
+                clusterReply *entry = row->element[j];
+                if (entry->type == TYPE_MULTIBULK && entry->elements >= 2) {
+                    clusterReply *host = entry->element[0];
+                    if (host->type == TYPE_BULK && host->len <= 0) {
+                        if (host->str) efree(host->str);
+                        host->str = estrndup(ZSTR_VAL(source->host), ZSTR_LEN(source->host));
+                        host->len = ZSTR_LEN(source->host);
+                    }
+                }
             }
         }
-        redis_sock_disconnect(seed, 0, 1);
-        if (mapped) break;
-    } ZEND_HASH_FOREACH_END();
-
-    // Clean up slots reply if we got one
-    if (slots) cluster_free_reply(slots, 1);
-
-    // Throw an exception if we couldn't map
-    if (!mapped) {
-        CLUSTER_THROW_EXCEPTION("Couldn't map cluster keyspace using any provided seed", 0);
-        return FAILURE;
+        result = cluster_map_slots(c, reply);
+        cluster_free_reply(reply, 1);
     }
+    redis_sock_disconnect(probe, 1, 1);
+    redis_free_socket(probe);
+    /* A failed private probe is not the caller's command failure. */
+    if (EG(exception) && instanceof_function(EG(exception)->ce, redis_exception_ce))
+        zend_clear_exception();
+    return result;
+}
 
-    return SUCCESS;
+static int cluster_refresh(redisCluster *c, RedisSock *preferred) {
+    HashTable tried;
+    redisClusterNode *node, *slave;
+    RedisSock *seed;
+    zend_string *key;
+    long long start = mstime();
+    int result = FAILURE;
+    if (EG(exception)) return FAILURE;
+    zend_hash_init(&tried, 0, NULL, NULL, 0);
+#define TRY_SOURCE(sock) do { \
+    key = strpprintf(0, "%s:%u", ZSTR_VAL((sock)->host), (sock)->port); \
+    if (!zend_hash_exists(&tried, key) && (!c->waitms || mstime() - start < c->waitms)) { \
+        zend_hash_add_empty_element(&tried, key); \
+        result = cluster_probe(c, sock); \
+    } \
+    zend_string_release(key); \
+    if (result == SUCCESS || EG(exception)) goto done; \
+} while (0)
+    if (preferred) TRY_SOURCE(preferred);
+    ZEND_HASH_FOREACH_PTR(c->nodes, node) {
+        TRY_SOURCE(node->sock);
+        if (node->slaves) {
+            ZEND_HASH_FOREACH_PTR(node->slaves, slave) {
+                TRY_SOURCE(slave->sock);
+            } ZEND_HASH_FOREACH_END();
+        }
+    } ZEND_HASH_FOREACH_END();
+    ZEND_HASH_FOREACH_PTR(c->seeds, seed) {
+        TRY_SOURCE(seed);
+    } ZEND_HASH_FOREACH_END();
+done:
+#undef TRY_SOURCE
+    zend_hash_destroy(&tried);
+    return result;
+}
+
+PHP_REDIS_API int cluster_map_keyspace(redisCluster *c) {
+    if (cluster_refresh(c, NULL) == SUCCESS) return SUCCESS;
+    if (!EG(exception)) CLUSTER_THROW_EXCEPTION("Couldn't map cluster keyspace using any provided seed", 0);
+    return FAILURE;
 }
 
 /* Parse the MOVED OR ASK redirection payload when we get such a response
@@ -1151,12 +1226,23 @@ static int cluster_set_redirection(redisCluster* c, char *msg, int moved)
     if ((port = strrchr(host, ':')) == NULL) return -1;
     *port++ = '\0';
 
-    // Success, apply it
+    char *end;
+    long slot = strtol(msg, &end, 10);
+    if (*end || slot < 0 || slot >= REDIS_CLUSTER_SLOTS) return FAILURE;
+    long number = strtol(port, &end, 10);
+    if ((*end && *end != '\r') || number < 1 || number > 65535) return FAILURE;
+    size_t len = strlen(host);
+    if (!len) {
+        host = ZSTR_VAL(c->cmd_sock->host);
+        len = ZSTR_LEN(c->cmd_sock->host);
+    }
+    if (len >= sizeof(c->redir_host)) return FAILURE;
     c->redir_type = moved ? REDIR_MOVED : REDIR_ASK;
-    strncpy(c->redir_host, host, sizeof(c->redir_host) - 1);
-    c->redir_host_len = port - host - 1;
-    c->redir_slot = (unsigned short)atoi(msg);
-    c->redir_port = (unsigned short)atoi(port);
+    memcpy(c->redir_host, host, len);
+    c->redir_host[len] = '\0';
+    c->redir_host_len = len;
+    c->redir_slot = slot;
+    c->redir_port = number;
 
     return 0;
 }
@@ -1230,6 +1316,7 @@ static int cluster_check_response(redisCluster *c, REDIS_REPLY_TYPE *reply_type)
 PHP_REDIS_API void cluster_disconnect(redisCluster *c, int force) {
     redisClusterNode *node, *slave;
 
+    if (c->asking_sock) redis_sock_disconnect(c->asking_sock, 1, 1);
     ZEND_HASH_FOREACH_PTR(c->nodes, node) {
         if (node == NULL) continue;
 
@@ -1286,6 +1373,8 @@ static int cluster_dist_write(redisCluster *c, const char *cmd, size_t sz,
                 efree(nodes);
                 return 0;
             }
+            redis_sock_disconnect(redis_sock, 1, 1);
+            break;
         }
     }
 
@@ -1296,33 +1385,13 @@ static int cluster_dist_write(redisCluster *c, const char *cmd, size_t sz,
     return -1;
 }
 
-/* Attempt to write our command to the current c->cmd_sock socket.  For write
- * commands, we attempt to query the master for this slot, and in the event of
- * a failure, try to query every remaining node for a redirection.
- *
- * If we're issuing a readonly command, we use one of three strategies, depending
- * on our redisCluster->failover setting.
- *
- * REDIS_FAILOVER_NONE:
- *   The command is treated just like a write command, and will only be executed
- *   against the known master for this slot.
- * REDIS_FAILOVER_ERROR:
- *   If we're unable to communicate with this slot's master, we attempt the query
- *   against any slaves (at random) that this master has.
- * REDIS_FAILOVER_DISTRIBUTE:
- *   We pick at random from the master and any slaves it has.  This option will
- *   load balance between masters and slaves
- * REDIS_FAILOVER_DISTRIBUTE_SLAVES:
- *   We pick at random from slave nodes of a given master.  This option is
- *   used to load balance read queries against N slaves.
- *
- * Once we are able to find a node we can write to, we check for MOVED or
- * ASKING redirection, such that the keyspace can be updated.
-*/
+/* Select a primary or replica using the configured read policy.  Once a
+ * payload write has been attempted, any transport failure is final: sending
+ * it again could duplicate a command whose result was lost.  Direct commands
+ * and redirect destinations bypass replica distribution. */
 static int cluster_sock_write(redisCluster *c, const char *cmd, size_t sz,
                               int direct)
 {
-    redisClusterNode *seed_node;
     RedisSock *redis_sock;
     int failover, nomaster;
 
@@ -1330,7 +1399,7 @@ static int cluster_sock_write(redisCluster *c, const char *cmd, size_t sz,
     redis_sock = c->cmd_sock;
 
     /* Readonly is irrelevant if we're not configured to failover */
-    failover = c->readonly && c->failover != REDIS_FAILOVER_NONE ?
+    failover = !direct && c->redir_type == REDIR_NONE && c->readonly && c->failover != REDIS_FAILOVER_NONE ?
         c->failover : REDIS_FAILOVER_NONE;
 
     /* If in ASK redirection, get/create the node for that host:port, otherwise
@@ -1350,9 +1419,10 @@ static int cluster_sock_write(redisCluster *c, const char *cmd, size_t sz,
         /* Success if we can send our payload to the master */
         if (CLUSTER_SEND_PAYLOAD(redis_sock, cmd, sz)) return 0;
     } else if (failover == REDIS_FAILOVER_ERROR) {
-        /* Try the master, then fall back to any slaves we may have */
-        if (CLUSTER_SEND_PAYLOAD(redis_sock, cmd, sz) ||
-           !cluster_dist_write(c, cmd, sz, 1)) return 0;
+        /* Fallback is safe only before attempting the user's payload. */
+        if (redis_sock_server_open(redis_sock) != SUCCESS) {
+            if (!cluster_dist_write(c, cmd, sz, 1)) return 0;
+        } else if (CLUSTER_SEND_PAYLOAD(redis_sock, cmd, sz)) return 0;
     } else {
         /* Include or exclude master node depending on failover option and
          * attempt to make our write */
@@ -1363,111 +1433,23 @@ static int cluster_sock_write(redisCluster *c, const char *cmd, size_t sz,
         }
     }
 
-    /* Don't fall back if direct communication with this slot is required. */
-    if (direct) return -1;
-
-    /* Fall back by attempting the request against every known node */
-    ZEND_HASH_FOREACH_PTR(c->nodes, seed_node) {
-        /* Skip this node if it's the one that failed, or if it's a slave */
-        if (seed_node == NULL || seed_node->sock == redis_sock || seed_node->slave) continue;
-
-        /* Connect to this node if we haven't already and attempt to write our request to this node */
-        if (CLUSTER_SEND_PAYLOAD(seed_node->sock, cmd, sz)) {
-            c->cmd_slot = seed_node->slot;
-            c->cmd_sock = seed_node->sock;
-            return 0;
-        }
-    } ZEND_HASH_FOREACH_END();
-
-    /* We were unable to write to any node in our cluster */
+    /* A failed write may have sent bytes. Never replay its payload. */
+    redis_sock_disconnect(c->cmd_sock, 1, 1);
     return -1;
-}
-
-/* Helper to find if we've got a host:port mapped in our cluster nodes. */
-static redisClusterNode *cluster_find_node(redisCluster *c, const char *host,
-                                           unsigned short port)
-{
-    int key_len;
-    char key[1024];
-
-    key_len = snprintf(key,sizeof(key),"%s:%d", host, port);
-
-    return zend_hash_str_find_ptr(c->nodes, key, key_len);
 }
 
 /* Provided a redisCluster object, the slot where we thought data was and
  * the slot where data was moved, update our node mapping */
 static int cluster_update_slot(redisCluster *c) {
-    redisClusterNode *node;
-    char key[1024];
-    size_t klen;
-
-    /* Do we already have the new slot mapped */
-    if (c->master[c->redir_slot]) {
-        /* No need to do anything if it's the same node */
-        if (!CLUSTER_REDIR_CMP(c, SLOT_SOCK(c,c->redir_slot))) {
-            return SUCCESS;
-        }
-
-        /* Check to see if we have this new node mapped */
-        node = cluster_find_node(c, c->redir_host, c->redir_port);
-
-        if (node) {
-            /* Just point to this slot */
-            c->master[c->redir_slot] = node;
-        } else {
-            /* If the redirected node is a replica of the previous slot owner, a failover has taken place.
-            We must then remap the cluster's keyspace in order to update the cluster's topology. */
-            redisClusterNode *prev_master = SLOT(c,c->redir_slot);
-            if (NULL == prev_master->slaves) {
-                CLUSTER_THROW_EXCEPTION("Redis Cluster's master data is incomplete.  Cluster is in invalid state.", 0);
-                return FAILURE;
-            }
-            redisClusterNode *slave;
-            ZEND_HASH_FOREACH_PTR(prev_master->slaves, slave) {
-                if (slave == NULL) {
-                    continue;
-                }
-                if (!CLUSTER_REDIR_CMP(c, slave->sock)) {
-                    // Detected a failover, the redirected node was a replica
-                    // Remap the cluster's keyspace
-                    if (cluster_map_keyspace(c) == FAILURE) {
-                        CLUSTER_THROW_EXCEPTION("Failed to remap cluster keyspace after failover", 0);
-                        return FAILURE;
-                    }
-                    return SUCCESS;
-                }
-            } ZEND_HASH_FOREACH_END();
-
-            /* Create our node */
-            node = cluster_node_create(c, c->redir_host, c->redir_host_len,
-                c->redir_port, c->redir_slot, 0);
-
-            /* Our node is new, so keep track of it for cleanup */
-            klen = snprintf(key, sizeof(key), "%s:%d", c->redir_host, c->redir_port);
-            zend_hash_str_update_ptr(c->nodes, key, klen, node);
-
-            /* Now point our slot at the node */
-            c->master[c->redir_slot] = node;
-        }
-    } else {
-        /* Check to see if the ip and port are mapped */
-        node = cluster_find_node(c, c->redir_host, c->redir_port);
-        if (!node) {
-            node = cluster_node_create(c, c->redir_host, c->redir_host_len,
-                c->redir_port, c->redir_slot, 0);
-        }
-
-        /* Map the slot to this node */
-        c->master[c->redir_slot] = node;
+    RedisSock *target = redis_sock_create(c->redir_host, c->redir_host_len,
+        c->redir_port, c->flags->timeout, c->flags->read_timeout, 0, NULL, 0);
+    int result = cluster_refresh(c, target);
+    redis_free_socket(target);
+    if (result == FAILURE || !SLOT(c, c->redir_slot) ||
+        CLUSTER_REDIR_CMP(c, SLOT_SOCK(c, c->redir_slot))) {
+        if (!EG(exception)) CLUSTER_THROW_EXCEPTION("Unable to refresh topology matching MOVED destination", 0);
+        return FAILURE;
     }
-
-    /* Update slot inside of node, so it can be found for command sending */
-    node->slot = c->redir_slot;
-
-    /* Make sure we unflag this node as a slave, as Redis Cluster will only ever
-     * direct us to master nodes. */
-    node->slave = 0;
     return SUCCESS;
 }
 
@@ -1523,6 +1505,11 @@ PHP_REDIS_API int cluster_send_slot(redisCluster *c, short slot, char *cmd,
                              int cmd_len, REDIS_REPLY_TYPE rtype)
 {
     /* Point our cluster to this slot and it's socket */
+    if (!SLOT(c, slot)) {
+        CLUSTER_THROW_EXCEPTION("Requested slot has no owner", 0);
+        return FAILURE;
+    }
+    c->redir_type = REDIR_NONE;
     c->cmd_slot = slot;
     c->cmd_sock = SLOT_SOCK(c, slot);
 
@@ -1542,8 +1529,13 @@ PHP_REDIS_API int cluster_send_slot(redisCluster *c, short slot, char *cmd,
     c->flags->txBytes += cmd_len;
 
     /* Check our response */
-    if (cluster_check_response(c, &c->reply_type) != 0 ||
-       (rtype != TYPE_EOF && rtype != c->reply_type)) return -1;
+    int response = cluster_check_response(c, &c->reply_type);
+    if (response < 0) redis_sock_disconnect(c->cmd_sock, 1, 1);
+    if (response != 0) return FAILURE;
+    if (rtype != TYPE_EOF && rtype != c->reply_type) {
+        redis_sock_disconnect(c->cmd_sock, 1, 1);
+        return FAILURE;
+    }
 
     /* Success */
     return 0;
@@ -1554,7 +1546,7 @@ PHP_REDIS_API int cluster_send_slot(redisCluster *c, short slot, char *cmd,
 PHP_REDIS_API short cluster_send_command(redisCluster *c, short slot, const char *cmd,
                                          int cmd_len)
 {
-    int resp, timedout = 0;
+    int resp, timedout = 0, refreshed = 0;
     long msstart;
 
     if (!SLOT(c, slot)) {
@@ -1562,10 +1554,25 @@ PHP_REDIS_API short cluster_send_command(redisCluster *c, short slot, const char
             "The slot %d is not covered by any node in this cluster", slot);
         return -1;
     }
-    /* Set the slot we're operating against as well as it's socket.  These can
-     * change during our request loop if we have a master failure and are
-     * configured to fall back to slave nodes, or if we have to fall back to
-     * a different slot due to no nodes serving this slot being reachable. */
+    c->redir_type = REDIR_NONE;
+    /* Only connection establishment can be retried before sending payload. */
+    if ((!c->readonly || c->failover == REDIS_FAILOVER_NONE) &&
+        SLOT_SOCK(c, slot)->status == REDIS_SOCK_STATUS_DISCONNECTED) {
+        RedisSock *sock = SLOT_SOCK(c, slot);
+        if (redis_sock_connect(sock) == FAILURE && redis_sock_connect(sock) == FAILURE) {
+            if (!cluster_can_refresh(c)) {
+                CLUSTER_THROW_EXCEPTION("Cannot recover connection during WATCH/MULTI", 0);
+                return FAILURE;
+            }
+            cluster_cache_clear(c);
+            if (cluster_refresh(c, NULL) == FAILURE || !SLOT(c, slot)) {
+                if (!EG(exception)) CLUSTER_THROW_EXCEPTION("Unable to refresh topology after connection failures", 0);
+                return FAILURE;
+            }
+            refreshed = 1;
+        }
+    }
+    /* Keep the requested slot fixed while following explicit redirections. */
     c->cmd_slot = slot;
     c->cmd_sock = SLOT_SOCK(c, slot);
 
@@ -1585,11 +1592,9 @@ PHP_REDIS_API short cluster_send_command(redisCluster *c, short slot, const char
             }
         }
 
-        /* Attempt to deliver our command to the node, and that failing, to any
-         * node until we find one that is available. */
+        /* A failed payload attempt is final, even if another node is healthy. */
         if (cluster_sock_write(c, cmd, cmd_len, 0) == -1) {
-            /* We have to abort, as no nodes are reachable */
-            CLUSTER_THROW_EXCEPTION("Can't communicate with any node in the cluster", 0);
+            if (!EG(exception)) CLUSTER_THROW_EXCEPTION("Failed sending command to Redis node", 0);
             return -1;
         }
 
@@ -1602,13 +1607,17 @@ PHP_REDIS_API short cluster_send_command(redisCluster *c, short slot, const char
         /* Handle MOVED or ASKING redirection */
         if (resp == 1) {
            /* Abort if we're in a transaction as it will be invalid */
-           if (c->flags->mode == MULTI) {
-               CLUSTER_THROW_EXCEPTION("Can't process MULTI sequence when cluster is resharding", 0);
+           if (!cluster_can_refresh(c)) {
+               CLUSTER_THROW_EXCEPTION("Can't process redirection during WATCH/MULTI", 0);
                return -1;
            }
 
            if (c->redir_type == REDIR_MOVED) {
-               /* For MOVED redirection we want to update our cached mapping */
+               cluster_cache_clear(c);
+               if (refreshed++) {
+                   CLUSTER_THROW_EXCEPTION("Topology changed again during command", 0);
+                   return FAILURE;
+               }
                if (FAILURE == cluster_update_slot(c)) {
                    return -1;
                }
